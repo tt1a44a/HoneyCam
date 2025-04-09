@@ -1,0 +1,22 @@
+# Honeycam camera scanner requirements
+# Install with: pip install -r requirements.txt
+
+# Core functionality
+opencv-python>=4.5.0    # For RTSP stream capture and image processing
+requests>=2.25.0        # For HTTP requests
+shodan>=1.25.0          # For Shodan API interaction
+python-dotenv>=0.15.0   # For loading API keys from .env files
+pillow>=8.0.0           # For image processing 
+
+# Optional dependencies
+numpy>=1.19.0           # Image manipulation
+matplotlib>=3.3.0       # For visualization (optional)
+imutils>=0.5.3          # Image utilities
+
+# Security-related
+pycryptodome>=3.9.9     # For cryptographic operations
+pyOpenSSL>=20.0.0       # For SSL/TLS connections
+
+# Concurrency
+futures>=3.1.1          # For ThreadPoolExecutor in Python 2
+# futures is built-in for Python 3 (concurrent.futures) 
