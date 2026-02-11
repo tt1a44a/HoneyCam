@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """
-Honeywell Camera Scanner
+Honeywell / Hikvision Camera Scanner
 
-This script scans Shodan for Honeywell cameras with specific port configurations
-and tests RTSP stream connections using various URL schemes.
+Discovers and tests IP cameras using three modes:
+  --ip       : Test a single known IP address
+  --scan     : Use masscan to find cameras on a network (requires masscan installed)
+  --api-key  : Use Shodan API to search for cameras
 
 Requirements:
-- Shodan API key
 - Packages: shodan, requests, opencv-python
+- Optional: masscan (for --scan mode)
 """
 
 import os
@@ -19,7 +21,10 @@ import base64
 import re
 import socket
 import threading
+import subprocess
+import tempfile
 from urllib.parse import urlparse
+from collections import defaultdict
 
 import shodan
 import requests
@@ -103,6 +108,26 @@ HTTP_HEADERS = {
     "Accept-Language": "en-US,en;q=0.5",
     "Connection": "keep-alive"
 }
+
+# Camera fingerprint signatures for identifying vendor from banners
+# All match strings are lowercased for case-insensitive comparison
+CAMERA_SIGNATURES = {
+    "hikvision": {
+        "http_headers": ["hikvision-webs", "dnvrs-webs", "app-webs", "davinci", "hikvision"],
+        "http_body": ["hikvision"],
+        "rtsp_banner": ["hikvision", "streaming media", "dnvrs"],
+        "probe_paths": ["/doc/page/login.asp"],
+    },
+    "honeywell": {
+        "http_headers": ["honeywell"],
+        "http_body": ["honeywell"],
+        "rtsp_banner": ["honeywell"],
+        "probe_paths": ["/img/video.mjpeg", "/cgi-bin/jpg/image.cgi"],
+    },
+}
+
+# Default ports to scan with masscan (RTSP + HTTP camera ports)
+DEFAULT_SCAN_PORTS = "554,8554,80,8080,8000,8001,8081,8888,443"
 
 def ensure_dir(directory):
     """Make sure a directory exists, creating it if necessary"""
@@ -212,6 +237,299 @@ def encode_basic_auth(username, password):
     """Create Basic authentication string for URL parameters"""
     auth_string = f"{username}:{password}"
     return base64.b64encode(auth_string.encode('utf-8')).decode('utf-8')
+
+def rtsp_banner_grab(ip, port, timeout=3):
+    """
+    Send an RTSP OPTIONS request and extract the Server header from the response.
+    Returns a dict with banner info or None if the port doesn't speak RTSP.
+    """
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        s.connect((ip, port))
+
+        request = f"OPTIONS rtsp://{ip}:{port} RTSP/1.0\r\nCSeq: 1\r\n\r\n"
+        s.sendall(request.encode('ascii'))
+
+        response = b""
+        while True:
+            try:
+                chunk = s.recv(4096)
+                if not chunk:
+                    break
+                response += chunk
+                # RTSP responses end with double CRLF
+                if b"\r\n\r\n" in response:
+                    break
+            except socket.timeout:
+                break
+
+        s.close()
+
+        if not response:
+            return None
+
+        text = response.decode('ascii', errors='replace')
+
+        # Must look like an RTSP response
+        if not text.startswith("RTSP/"):
+            return None
+
+        result = {
+            "banner": text.split("\r\n")[0],
+            "server": "",
+            "vendor": "unknown",
+        }
+
+        # Extract Server header
+        for line in text.split("\r\n"):
+            if line.lower().startswith("server:"):
+                result["server"] = line.split(":", 1)[1].strip()
+                break
+
+        # Match against known signatures
+        server_lower = result["server"].lower()
+        banner_lower = text.lower()
+        for vendor, sigs in CAMERA_SIGNATURES.items():
+            for pattern in sigs.get("rtsp_banner", []):
+                if pattern in server_lower or pattern in banner_lower:
+                    result["vendor"] = vendor
+                    return result
+
+        # Valid RTSP but unknown vendor
+        return result
+
+    except (socket.timeout, ConnectionRefusedError, OSError):
+        return None
+
+
+def http_fingerprint(ip, port, timeout=3):
+    """
+    Probe an HTTP port to identify the camera vendor from Server header,
+    response body, and known probe paths.
+    Returns a dict with fingerprint info or None if not identifiable.
+    """
+    result = {
+        "server": "",
+        "vendor": "unknown",
+        "matched_path": None,
+    }
+
+    # Phase 1: GET / and check Server header + body
+    base_url = f"http://{ip}:{port}"
+    try:
+        resp = requests.get(
+            f"{base_url}/",
+            timeout=timeout,
+            headers=HTTP_HEADERS,
+            allow_redirects=True,
+            verify=False,
+        )
+        server_header = resp.headers.get("Server", "")
+        result["server"] = server_header
+        server_lower = server_header.lower()
+        body_lower = resp.text[:4096].lower()
+
+        for vendor, sigs in CAMERA_SIGNATURES.items():
+            # Check Server header
+            for pattern in sigs.get("http_headers", []):
+                if pattern in server_lower:
+                    result["vendor"] = vendor
+                    return result
+            # Check body
+            for pattern in sigs.get("http_body", []):
+                if pattern in body_lower:
+                    result["vendor"] = vendor
+                    return result
+    except Exception:
+        pass
+
+    # Phase 2: Try vendor-specific probe paths
+    for vendor, sigs in CAMERA_SIGNATURES.items():
+        for path in sigs.get("probe_paths", []):
+            try:
+                resp = requests.get(
+                    f"{base_url}{path}",
+                    timeout=timeout,
+                    headers=HTTP_HEADERS,
+                    allow_redirects=True,
+                    verify=False,
+                )
+                if resp.status_code == 200:
+                    body_lower = resp.text[:4096].lower()
+                    for body_pattern in sigs.get("http_body", []):
+                        if body_pattern in body_lower:
+                            result["vendor"] = vendor
+                            result["matched_path"] = path
+                            return result
+                    # Even a 200 on a vendor-specific path is a strong signal
+                    if vendor == "hikvision" and path == "/doc/page/login.asp":
+                        result["vendor"] = vendor
+                        result["matched_path"] = path
+                        return result
+            except Exception:
+                pass
+
+    # Could not identify vendor but port was reachable
+    if result["server"]:
+        return result
+    return None
+
+
+def fingerprint_host(ip, port, timeout=3):
+    """
+    Fingerprint a single ip:port to determine if it is a camera and identify the vendor.
+    Dispatches to RTSP or HTTP fingerprinting based on port type.
+    Returns a dict with ip, port, vendor, type, server/banner or None.
+    """
+    info = {
+        "ip": ip,
+        "port": port,
+        "vendor": "unknown",
+        "type": None,
+        "server": "",
+        "banner": "",
+    }
+
+    if port in COMMON_RTSP_PORTS:
+        result = rtsp_banner_grab(ip, port, timeout)
+        if result:
+            info["type"] = "rtsp"
+            info["vendor"] = result.get("vendor", "unknown")
+            info["server"] = result.get("server", "")
+            info["banner"] = result.get("banner", "")
+            return info
+
+    if port in COMMON_HTTP_PORTS or port == 443:
+        result = http_fingerprint(ip, port, timeout)
+        if result:
+            info["type"] = "http"
+            info["vendor"] = result.get("vendor", "unknown")
+            info["server"] = result.get("server", "")
+            if result.get("matched_path"):
+                info["banner"] = f"Matched path: {result['matched_path']}"
+            return info
+
+    # Port not in known lists -- try both
+    result = rtsp_banner_grab(ip, port, timeout)
+    if result:
+        info["type"] = "rtsp"
+        info["vendor"] = result.get("vendor", "unknown")
+        info["server"] = result.get("server", "")
+        info["banner"] = result.get("banner", "")
+        return info
+
+    result = http_fingerprint(ip, port, timeout)
+    if result:
+        info["type"] = "http"
+        info["vendor"] = result.get("vendor", "unknown")
+        info["server"] = result.get("server", "")
+        return info
+
+    return None
+
+
+def run_masscan(targets, ports=DEFAULT_SCAN_PORTS, rate=1000, masscan_path="masscan"):
+    """
+    Run masscan against targets and return a list of {ip, port} dicts.
+    targets: CIDR range, single IP, or path to a file containing targets.
+    """
+    # Build the masscan command
+    with tempfile.NamedTemporaryFile(suffix=".json", delete=False, mode="w") as tmp:
+        tmp_path = tmp.name
+
+    try:
+        cmd = [masscan_path]
+
+        # If targets looks like a file path, use -iL
+        if os.path.isfile(targets):
+            cmd.extend(["-iL", targets])
+        else:
+            cmd.append(targets)
+
+        cmd.extend([
+            "-p", str(ports),
+            "--rate", str(rate),
+            "-oJ", tmp_path,
+            "--wait", "3",
+        ])
+
+        print(f"Running masscan: {' '.join(cmd)}")
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+        )
+
+        if proc.returncode != 0 and proc.returncode != 1:
+            # masscan returns 1 when it finds hosts, 0 when no hosts found
+            stderr = proc.stderr.strip()
+            if "FAIL" in stderr or "not found" in stderr.lower() or "errno" in stderr.lower():
+                print(f"masscan error: {stderr}")
+                return []
+
+        # Parse the JSON output
+        # masscan JSON has a trailing comma bug: [{...},{...},]
+        try:
+            with open(tmp_path, "r") as f:
+                raw = f.read().strip()
+        except FileNotFoundError:
+            print("masscan produced no output file")
+            return []
+
+        if not raw:
+            print("masscan returned no results")
+            return []
+
+        # Fix trailing commas that masscan leaves in the JSON
+        raw = raw.replace(",\n]", "\n]").replace(",]", "]").replace(",\n}", "\n}")
+        # masscan sometimes wraps output differently; handle both array and bare
+        if not raw.startswith("["):
+            raw = "[" + raw + "]"
+
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as e:
+            print(f"Failed to parse masscan JSON: {e}")
+            # Try line-by-line as fallback
+            data = []
+            for line in raw.split("\n"):
+                line = line.strip().rstrip(",")
+                if line.startswith("{"):
+                    try:
+                        data.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        pass
+
+        results = []
+        seen = set()
+        for entry in data:
+            ip = entry.get("ip")
+            for port_info in entry.get("ports", []):
+                port = port_info.get("port")
+                if ip and port:
+                    key = (ip, port)
+                    if key not in seen:
+                        seen.add(key)
+                        results.append({"ip": ip, "port": port})
+
+        print(f"masscan found {len(results)} open port(s) across {len(set(r['ip'] for r in results))} host(s)")
+        return results
+
+    except FileNotFoundError:
+        print(f"Error: masscan not found at '{masscan_path}'")
+        print("Install masscan: sudo apt install masscan  (or download from https://github.com/robertdavidgraham/masscan)")
+        return []
+    except Exception as e:
+        print(f"Error running masscan: {e}")
+        return []
+    finally:
+        # Clean up temp file
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
 
 def detect_camera_ports(camera_data):
     """
@@ -597,7 +915,14 @@ def main():
     parser.add_argument('--http-port', type=int, help='Custom HTTP port to use')
     parser.add_argument('--auto-detect-ports', action='store_true', help='Automatically detect ports (default)')
     parser.add_argument('--notify', action='store_true', help='Play notification sound when camera found')
-    
+
+    # Masscan mode arguments
+    parser.add_argument('--scan', help='Scan targets with masscan (CIDR, IP, or file of targets)')
+    parser.add_argument('--rate', type=int, default=1000, help='Masscan packet rate (default: 1000)')
+    parser.add_argument('--masscan-path', default='masscan', help='Path to masscan binary (default: masscan)')
+    parser.add_argument('--ports', default=DEFAULT_SCAN_PORTS,
+                        help=f'Ports to scan with masscan (default: {DEFAULT_SCAN_PORTS})')
+
     args = parser.parse_args()
     
     # Create organized directory structure
@@ -695,14 +1020,151 @@ def main():
                 f.write(f"{result}\n")
                 print(result)
     
+    # Masscan scan mode
+    elif args.scan:
+        print(f"Starting masscan scan against: {args.scan}")
+        print(f"Ports: {args.ports} | Rate: {args.rate}")
+
+        # Phase 1: Run masscan to discover open ports
+        scan_results = run_masscan(
+            args.scan,
+            ports=args.ports,
+            rate=args.rate,
+            masscan_path=args.masscan_path,
+        )
+
+        if not scan_results:
+            print("No open ports found by masscan")
+            sys.exit(2)
+
+        # Phase 2: Fingerprint each discovered ip:port
+        print(f"\nFingerprinting {len(scan_results)} open port(s)...")
+        cameras_by_ip = defaultdict(lambda: {"ports": {}, "vendor": "unknown"})
+
+        for i, entry in enumerate(scan_results, 1):
+            ip = entry["ip"]
+            port = entry["port"]
+            print(f"  [{i}/{len(scan_results)}] Probing {ip}:{port}...", end=" ")
+
+            fp = fingerprint_host(ip, port, timeout=args.timeout)
+            if fp:
+                port_type = fp.get("type", "unknown")
+                vendor = fp.get("vendor", "unknown")
+                server = fp.get("server", "")
+                print(f"{port_type.upper()} - {vendor} ({server})" if server else f"{port_type.upper()} - {vendor}")
+
+                cam = cameras_by_ip[ip]
+                cam["ports"][port] = fp
+                # Promote vendor if identified (don't downgrade from known to unknown)
+                if vendor != "unknown":
+                    cam["vendor"] = vendor
+            else:
+                print("no response")
+
+        if not cameras_by_ip:
+            print("\nNo camera services detected on any host")
+            sys.exit(2)
+
+        # Count vendors
+        vendor_counts = defaultdict(int)
+        for ip, cam in cameras_by_ip.items():
+            vendor_counts[cam["vendor"]] += 1
+        summary_parts = [f"{count} {vendor}" for vendor, count in sorted(vendor_counts.items())]
+        print(f"\nIdentified {len(cameras_by_ip)} host(s): {', '.join(summary_parts)}")
+
+        # Phase 3: Test camera URLs on each identified host
+        # Save discovery/fingerprint results to file
+        discovery_file = os.path.join(logs_dir, "masscan_discovery.txt")
+        with open(discovery_file, 'w', encoding='utf-8') as f:
+            f.write(f"Masscan scan: {args.scan}\n")
+            f.write(f"Ports scanned: {args.ports}\n")
+            f.write(f"Hosts found: {len(cameras_by_ip)}\n")
+            f.write(f"Breakdown: {', '.join(summary_parts)}\n")
+            f.write(f"{'='*50}\n\n")
+            for ip, cam in cameras_by_ip.items():
+                vendor = cam["vendor"]
+                for port, fp in sorted(cam["ports"].items()):
+                    svc_type = fp.get("type", "?")
+                    server = fp.get("server", "")
+                    line = f"{ip}:{port}  {svc_type.upper():5s}  {vendor:12s}  {server}"
+                    f.write(f"{line}\n")
+        print(f"Discovery results saved to: {discovery_file}")
+
+        print(f"\n{'='*50}")
+        print("Testing RTSP/HTTP streams on identified hosts...")
+        print(f"{'='*50}")
+
+        for i, (ip, cam) in enumerate(cameras_by_ip.items(), 1):
+            vendor = cam["vendor"]
+            port_list = sorted(cam["ports"].keys())
+
+            # Determine RTSP and HTTP ports from fingerprinting results
+            cam_rtsp_port = args.rtsp_port
+            cam_http_port = args.http_port
+            for p, fp in cam["ports"].items():
+                if fp["type"] == "rtsp" and not cam_rtsp_port:
+                    cam_rtsp_port = p
+                elif fp["type"] == "http" and not cam_http_port:
+                    cam_http_port = p
+
+            print(f"\n[{i}/{len(cameras_by_ip)}] Testing {ip} ({vendor}) - Ports: {port_list}")
+
+            # Channel enumeration if requested
+            channels_to_test = [args.channel]
+            camera_info = {}
+            if args.enum_channels:
+                camera_info = enumerate_camera_channels(ip, credentials,
+                                                        http_port=cam_http_port or 80,
+                                                        rtsp_port=cam_rtsp_port or 554)
+                if camera_info["available_channels"]:
+                    channels_to_test = camera_info["available_channels"]
+                    print(f"Will test the following channels: {channels_to_test}")
+
+            all_results = []
+            for channel in channels_to_test:
+                print(f"\nTesting channel {channel}...")
+                results = test_camera_urls(ip, channel, credentials, args.save_frames,
+                                           rtsp_port=cam_rtsp_port, http_port=cam_http_port,
+                                           auto_detect=args.auto_detect_ports,
+                                           timeout=args.timeout)
+                all_results.extend(results)
+
+                if any("[OK]" in result for result in results):
+                    if ip not in working_ips:
+                        working_ips.append(ip)
+
+                    if args.notify:
+                        play_notification_sound()
+
+                    if args.until_success:
+                        break
+
+            # Save per-IP results file
+            ip_result_filename = os.path.join(logs_dir, f"camera_results_{ip}.txt")
+            with open(ip_result_filename, 'w', encoding='utf-8') as f:
+                f.write(f"Camera: {ip}\n")
+                f.write(f"Vendor: {vendor}\n")
+                f.write(f"Open Ports: {port_list}\n")
+                f.write(f"Camera Name: {camera_info.get('camera_name', 'Unknown')}\n")
+                f.write(f"Available Channels: {camera_info.get('available_channels', channels_to_test)}\n\n")
+                for result in all_results:
+                    f.write(f"{result}\n")
+                    print(result)
+
+            if args.until_success and ip in working_ips:
+                print(f"\n--until-success: Found working camera at {ip}, stopping scan.")
+                break
+
+        # Save results to the specified result file if provided
+        if args.result_file:
+            with open(args.result_file, 'a', encoding='utf-8') as f:
+                f.write(f"\nMasscan scan complete. Scanned {len(cameras_by_ip)} camera host(s).\n")
+                f.write(f"Working cameras: {len(working_ips)}\n")
+                for ip in working_ips:
+                    f.write(f"  {ip}\n")
+
     # Shodan search
-    else:
-        # For Shodan searches, we need the API key
-        if not args.api_key:
-            print("Error: Shodan API key is required for Shodan searches")
-            print("Use --api-key parameter or set it in the .env file")
-            sys.exit(1)
-            
+    elif args.api_key:
         product_type = "custom cameras" if args.query else "Honeywell cameras"
         print(f"Searching Shodan for {product_type}...")
         cameras = search_shodan(args.api_key, args.limit, args.query, args.page)
@@ -786,6 +1248,12 @@ def main():
                 f.write(f"Working cameras: {len(working_ips)}\n")
                 for ip in working_ips:
                     f.write(f"  {ip}\n")
+
+    # No mode specified
+    else:
+        print("Error: specify one of --ip, --scan, or --api-key")
+        print("Run with --help for usage information")
+        sys.exit(1)
 
     # Write working_cameras.txt (used by shell scripts for summary)
     working_cameras_path = args.output_list if args.output_list else os.path.join(logs_dir, "working_cameras.txt")

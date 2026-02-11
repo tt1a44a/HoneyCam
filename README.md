@@ -1,15 +1,17 @@
 # Honeycam Camera Scanner
 
-A tool for automated discovery and testing of Honeywell IP cameras. This toolkit can scan individual IPs or leverage Shodan to find potentially accessible cameras and test various RTSP URL patterns.
+A tool for automated discovery and testing of Honeywell and Hikvision IP cameras. Three discovery modes: scan a single IP, sweep a network with masscan, or search Shodan. Fingerprints camera vendors from RTSP/HTTP banners and tests RTSP stream URLs.
 
 ## Key Features
 
+- **Masscan Integration**: Scan entire networks or CIDR ranges for cameras without a Shodan API key
+- **Camera Fingerprinting**: Identifies Hikvision and Honeywell cameras from RTSP and HTTP banners
 - **Auto-Port Detection**: Automatically detects RTSP and HTTP ports for cameras
 - **Multiple Camera Protocols**: Tests various RTSP URL patterns commonly used by Honeywell/Hikvision cameras
 - **Channel Enumeration**: Discovers available channels on cameras
 - **Credential Testing**: Attempts default credentials
 - **Frame Capture**: Can save screenshot of detected video streams
-- **Flexible Searching**: Can scan individual IPs or use Shodan for discovery
+- **Flexible Searching**: Single IP, masscan network sweep, or Shodan API
 
 ## Installation
 
@@ -19,13 +21,29 @@ A tool for automated discovery and testing of Honeywell IP cameras. This toolkit
    cd HoneyCam
    ```
 
-2. Create a `.env` file with your Shodan API key:
+2. Install Python dependencies:
+   ```
+   pip install -r requirements.txt
+   ```
+
+3. (Optional) Install masscan for network scanning mode:
+   ```bash
+   # Debian/Ubuntu
+   sudo apt install masscan
+
+   # macOS
+   brew install masscan
+
+   # From source: https://github.com/robertdavidgraham/masscan
+   ```
+
+4. (Optional) Create a `.env` file with your Shodan API key:
    ```
    cp .env.example .env
    # Edit .env with your preferred text editor and add your API key
    ```
 
-3. The scripts will automatically set up a virtual environment and install dependencies when first run.
+5. The shell scripts will automatically set up a virtual environment and install dependencies when first run.
 
 ## Usage
 
@@ -75,6 +93,41 @@ Examples:
 ./scan_honeywell_shodan.sh 500 "product:hikvision country:us" --unlimited --notify
 ```
 
+### 3. Scan a Network with Masscan
+
+Scan a CIDR range or list of targets for cameras without needing a Shodan API key:
+
+```bash
+# Scan a local subnet
+python honeycam_scanner.py --scan 192.168.1.0/24
+
+# Scan a larger range with higher packet rate
+python honeycam_scanner.py --scan 10.0.0.0/8 --rate 10000
+
+# Scan from a file of targets (one CIDR or IP per line)
+python honeycam_scanner.py --scan targets.txt
+
+# Scan specific ports only
+python honeycam_scanner.py --scan 192.168.1.0/24 --ports 554,80,8080
+
+# Scan and save frames from working cameras
+python honeycam_scanner.py --scan 192.168.1.0/24 --save-frames --notify
+
+# Use a custom masscan path
+python honeycam_scanner.py --scan 192.168.1.0/24 --masscan-path /usr/local/bin/masscan
+```
+
+Masscan options:
+- `--scan TARGETS` - CIDR range, single IP, or path to a file of targets
+- `--rate N` - Masscan packet rate (default: 1000)
+- `--ports PORTS` - Comma-separated ports to scan (default: 554,8554,80,8080,8000,8001,8081,8888,443)
+- `--masscan-path PATH` - Path to masscan binary (default: masscan)
+
+The scan pipeline:
+1. **Discovery** - masscan finds hosts with open camera ports
+2. **Fingerprint** - Python probes each port via RTSP OPTIONS and HTTP GET to identify camera vendor
+3. **Test** - Confirmed cameras are tested with all RTSP/HTTP URL patterns
+
 ## RTSP URL Patterns
 
 The scanner tests various RTSP URL patterns including:
@@ -101,10 +154,17 @@ The `captures` directory will contain frame captures from working cameras (when 
 
 ## Using Python Script Directly
 
-For advanced usage, you can run the Python script directly:
+The script has three discovery modes:
 
 ```bash
-python honeycam_scanner.py --ip 192.168.1.100 --save-frames --enum-channels --notify
+# Mode 1: Test a single IP
+python honeycam_scanner.py --ip 192.168.1.100 --save-frames --enum-channels
+
+# Mode 2: Scan a network with masscan (no API key needed)
+python honeycam_scanner.py --scan 192.168.1.0/24 --rate 1000
+
+# Mode 3: Search Shodan
+python honeycam_scanner.py --api-key YOUR_KEY --limit 50
 ```
 
 Run `python honeycam_scanner.py --help` for full list of available options.
