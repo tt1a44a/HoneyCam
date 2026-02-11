@@ -1,0 +1,9 @@
+services:
+  honeycam:
+    build: .
+    network_mode: host
+    cap_add:
+      - NET_RAW
+    volumes:
+      - ./results:/app/HoneyCam/logs
+      - ./captures:/app/HoneyCam/captures
