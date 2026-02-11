@@ -29,6 +29,7 @@ logs/*
 captures/*
 !logs/.gitkeep
 !captures/.gitkeep
+*.log
 
 # Environment variables (contains API keys)
 .env
